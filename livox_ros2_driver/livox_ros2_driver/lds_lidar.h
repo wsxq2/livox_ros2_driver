@@ -51,6 +51,9 @@ class LdsLidar : public Lds {
   int InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
                    const char *user_config_path);
   int DeInitLdsLidar(void);
+  
+  /** Write lidar timestamp to shared memory for camera synchronization */
+  void WriteTimestampToSharedMemory(int64_t timestamp);
 
  private:
   LdsLidar(uint32_t interval_ms);
@@ -114,6 +117,13 @@ class LdsLidar : public Lds {
   TimeSync *timesync_;
   TimeSyncConfig timesync_config_;
   std::mutex config_mutex_;
+
+  /* ── 共享内存：相机触发时间戳同步 ── */
+  struct SharedTimeStamp {
+    int64_t high;  // 预留
+    int64_t low;   // PPS 触发时刻的 PC 纳秒时间戳
+  };
+  SharedTimeStamp *timeshare_ptr_;  // mmap 指针，nullptr 表示未映射
 };
 
 }  // namespace livox_ros

@@ -408,6 +408,13 @@ uint32_t Lddc::PublishCustomPointcloud(LidarDataQueue *queue,
     if (!published_packet) {
       livox_msg.timebase = timestamp;
       packet_offset_time = 0;
+      
+      /* ── 将雷达时间戳写入共享内存，供相机驱动读取 ── */
+      LdsLidar *lds_lidar = dynamic_cast<LdsLidar *>(lds_);
+      if (lds_lidar) {
+        lds_lidar->WriteTimestampToSharedMemory(timestamp);
+      }
+      
       /** convert to ros time stamp */
       livox_msg.header.stamp = rclcpp::Time(timestamp);
     } else {

@@ -29,6 +29,11 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <time.h>
+#include <unistd.h>
+#include <cerrno>
 
 #include "rapidjson/document.h"
 #include "rapidjson/filereadstream.h"
@@ -48,6 +53,7 @@ LdsLidar *g_lds_ldiar = nullptr;
 LdsLidar::LdsLidar(uint32_t interval_ms) : Lds(interval_ms, kSourceRawLidar) {
   auto_connect_mode_ = true;
   is_initialized_ = false;
+  timeshare_ptr_ = nullptr;
 
   whitelist_count_ = 0;
   memset(broadcast_code_whitelist_, 0, sizeof(broadcast_code_whitelist_));
@@ -55,7 +61,12 @@ LdsLidar::LdsLidar(uint32_t interval_ms) : Lds(interval_ms, kSourceRawLidar) {
   ResetLdsLidar();
 }
 
-LdsLidar::~LdsLidar() {}
+LdsLidar::~LdsLidar() {
+  if (timeshare_ptr_ && timeshare_ptr_ != MAP_FAILED) {
+    munmap(timeshare_ptr_, sizeof(SharedTimeStamp));
+    timeshare_ptr_ = nullptr;
+  }
+}
 
 void LdsLidar::ResetLdsLidar(void) { ResetLds(kSourceRawLidar); }
 
@@ -102,6 +113,39 @@ int LdsLidar::InitLdsLidar(std::vector<std::string> &broadcast_code_strs,
     printf(
         "No broadcast code was added to whitelist, swith to automatic "
         "connection mode!\n");
+  }
+
+  /* ── 映射相机时间同步共享内存文件 ~/timeshare ── */
+  {
+    const char *uname = getlogin();
+    if (!uname) uname = "tmp";
+    std::string shm_path = std::string("/home/") + uname + "/timeshare";
+    int fd = open(shm_path.c_str(), O_RDWR);
+    if (fd < 0) {
+      /* 文件不存在时自动创建并初始化为 0 */
+      fd = open(shm_path.c_str(), O_RDWR | O_CREAT, 0666);
+      if (fd >= 0) {
+        SharedTimeStamp init_val = {0, 0};
+        if (write(fd, &init_val, sizeof(init_val)) != sizeof(init_val)) {
+          printf("[timeshare] write init failed (errno=%d)\n", errno);
+        }
+      }
+    }
+    if (fd >= 0) {
+      void *ptr = mmap(nullptr, sizeof(SharedTimeStamp),
+                       PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+      close(fd);
+      if (ptr == MAP_FAILED) {
+        printf("[timeshare] mmap failed (errno=%d), camera sync disabled\n", errno);
+        timeshare_ptr_ = nullptr;
+      } else {
+        timeshare_ptr_ = static_cast<SharedTimeStamp *>(ptr);
+        printf("[timeshare] mapped: %s\n", shm_path.c_str());
+      }
+    } else {
+      printf("[timeshare] cannot open/create %s (errno=%d), camera sync disabled\n",
+             shm_path.c_str(), errno);
+    }
   }
 
   if (enable_timesync_) {
@@ -540,6 +584,8 @@ void LdsLidar::SetRmcSyncTimeCb(livox_status status, uint8_t handle,
 void LdsLidar::ReceiveSyncTimeCallback(const char *rmc, uint32_t rmc_length,
                                        void *client_data) {
   LdsLidar *lds_lidar = static_cast<LdsLidar *>(client_data);
+
+  /* ── PPS 同步回调，时间戳将在发布点云时写入共享内存 ── */
   // std::unique_lock<std::mutex> lock(mtx);
   LidarDevice *p_lidar = nullptr;
   for (uint8_t handle = 0; handle < kMaxLidarCount; handle++) {
@@ -586,6 +632,13 @@ bool LdsLidar::IsBroadcastCodeExistInWhitelist(const char *broadcast_code) {
   }
 
   return false;
+}
+
+void LdsLidar::WriteTimestampToSharedMemory(int64_t timestamp) {
+  if (timeshare_ptr_) {
+    timeshare_ptr_->low = timestamp;
+    timeshare_ptr_->high = 0;  // 预留字段保持 0
+  }
 }
 
 int LdsLidar::ParseTimesyncConfig(rapidjson::Document &doc) {
